@@ -1,0 +1,15 @@
+{
+  "total_return_pct": -65.67074078850717,
+  "annualized_return_pct": -20.1254905030672,
+  "sharpe_ratio": -0.7931724221968929,
+  "sortino_ratio": -0.5292646400589358,
+  "max_drawdown_pct": -77.70932138901519,
+  "calmar_ratio": -0.25898425238226436,
+  "win_rate_pct": 33.333333333333336,
+  "avg_win": 0.061707817871525524,
+  "avg_loss": -0.09263686020278859,
+  "profit_factor": 0.3330629823616797,
+  "total_trades": 21,
+  "avg_trade_duration_days": 0.0,
+  "volatility_annual_pct": 24.502800982137536
+}
