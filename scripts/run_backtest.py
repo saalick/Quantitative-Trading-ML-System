@@ -1,133 +1,209 @@
-#!/usr/bin/env python3
+"""
+Enhanced Risk-Adjusted Performance Metrics
 
+Extends the backtesting metrics with institutional-grade risk measures:
+- Sortino Ratio (downside-deviation adjusted returns)
+- Calmar Ratio (return / max drawdown)
+- Omega Ratio (probability-weighted gains vs losses)
+- Tail Risk metrics (VaR, CVaR at 95% and 99%)
+- Gain-to-Pain Ratio
 
-import sys
-from pathlib import Path
+These complement the existing Sharpe Ratio and Max Drawdown metrics
+with measures commonly used in institutional portfolio evaluation.
+
+References:
+    - Sortino & Price (1994), "Performance Measurement in a Downside Risk Framework"
+    - Keating & Shadwick (2002), "A Universal Performance Measure"
+    - Rockafellar & Uryasev (2000), "Optimization of Conditional Value-at-Risk"
+"""
 
 import numpy as np
-import pandas as pd
-import torch
-import json
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from data.data_loader import load_ohlcv
-from src.feature_engineering import compute_all_features, FEATURE_COLUMNS
-from src.data_preprocessing import drop_missing_or_fill, create_sequences, scale_features
-from src.models.lstm_model import LSTMModel
-from src.backtesting.backtester import Backtester
-from src.backtesting.metrics import compute_metrics
-from src.backtesting.visualization import generate_all_plots
+from typing import Dict, Optional
 
 
-def main():
-    project_root = Path(__file__).resolve().parent.parent
-    data_path = project_root / "data" / "sample_data.csv"
-    model_path = project_root / "results" / "models" / "best_model.pt"
-    figures_dir = project_root / "results" / "figures"
-    metrics_dir = project_root / "results" / "metrics"
+def compute_sortino_ratio(
+    returns: np.ndarray,
+    risk_free_rate: float = 0.0,
+    annualization_factor: int = 252,
+) -> float:
+    """
+    Sortino Ratio: excess return / downside deviation.
 
-    df = load_ohlcv(data_path)
-    df_feat = compute_all_features(df)
-    df_feat = drop_missing_or_fill(df_feat, strategy="drop")
-    feature_cols = [c for c in FEATURE_COLUMNS if c in df_feat.columns]
-    X = df_feat[feature_cols].values.astype(np.float32)
-    seq_len = 60
-    X_seq, _ = create_sequences(X, np.zeros(len(X)), seq_len)
-    res = scale_features(X_seq, None, None)
-    X_scaled = res[0]
+    Unlike Sharpe, only penalizes negative volatility, making it
+    more appropriate for asymmetric return distributions common
+    in directional trading strategies.
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LSTMModel(input_size=X_scaled.shape[2], hidden_size=128, num_layers=2, dropout=0.2)
-    if model_path.exists():
-        state = torch.load(model_path, map_location=device)
-        model.load_state_dict(state["model_state_dict"], strict=True)
-    model.to(device)
-    model.eval()
-    with torch.no_grad():
-        preds = model(torch.tensor(X_scaled, dtype=torch.float32, device=device)).cpu().numpy().ravel()
+    Args:
+        returns: Array of periodic returns.
+        risk_free_rate: Risk-free rate per period (default 0).
+        annualization_factor: Trading days per year (default 252).
 
-    # Align with price index: predictions correspond to indices [seq_len, ..., n-1]
-    n = len(df)
-    signals_full = np.full(n, np.nan)
-    signals_full[seq_len : seq_len + len(preds)] = preds
-    signals_full = np.nan_to_num(signals_full, nan=0.5)
-    prices = df["close"].values
+    Returns:
+        Annualized Sortino Ratio.
+    """
+    if len(returns) < 2:
+        return 0.0
 
-    bt = Backtester(initial_capital=1_000_000, transaction_cost_pct=0.1, slippage_pct=0.05)
-    equity_df, trade_log, metrics = bt.run(prices, signals_full, threshold=0.5)
+    excess = returns - risk_free_rate
+    downside = np.minimum(excess, 0.0)
+    downside_std = np.sqrt(np.mean(downside ** 2))
 
-    # Buy-and-hold for comparison
-    bh = 1_000_000 * (prices / prices[0])
-    equity_df["equity"] = equity_df["equity"].values
+    if downside_std < 1e-10:
+        return 0.0
 
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    dates = df["date"].iloc[: len(equity_df)].values if len(equity_df) <= len(df) else df["date"].values
-    if len(dates) > len(equity_df):
-        dates = dates[: len(equity_df)]
-    generate_all_plots(
-        equity_df,
-        dates=pd.to_datetime(dates) if len(dates) else None,
-        buy_and_hold=bh[: len(equity_df)] if len(bh) >= len(equity_df) else None,
-        figures_dir=figures_dir,
-    )
-
-    with open(metrics_dir / "backtest_results.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-    trade_log.to_csv(metrics_dir / "trade_log.csv", index=False)
-
-    # Confusion matrix and ROC on test-range predictions (use same preds we already have)
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from sklearn.metrics import confusion_matrix, roc_curve, auc
-        # Recompute y_test from data for alignment with preds
-        close = df["close"].values
-        fwd_ret = np.roll(close, -1) / close - 1
-        y_all = (fwd_ret >= 0).astype(np.float32)
-        y_test = y_all[seq_len : seq_len + len(preds)]
-        pred_bin = (preds >= 0.5).astype(int)
-        cm = confusion_matrix(y_test, pred_bin)
-        fig, ax = plt.subplots(figsize=(5, 4))
-        im = ax.imshow(cm, cmap="Blues")
-        ax.set_xticks([0, 1])
-        ax.set_yticks([0, 1])
-        ax.set_xticklabels(["Down", "Up"])
-        ax.set_yticklabels(["Down", "Up"])
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("Actual")
-        for i in range(2):
-            for j in range(2):
-                ax.text(j, i, str(cm[i, j]), ha="center", va="center")
-        plt.colorbar(im, ax=ax)
-        ax.set_title("Confusion matrix")
-        fig.savefig(figures_dir / "confusion_matrix.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        fpr, tpr, _ = roc_curve(y_test, preds)
-        roc_auc = auc(fpr, tpr)
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
-        ax.plot([0, 1], [0, 1], "k--")
-        ax.set_xlabel("FPR")
-        ax.set_ylabel("TPR")
-        ax.legend()
-        ax.set_title("ROC curve")
-        fig.savefig(figures_dir / "roc_curve.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-    except Exception as e:
-        print("Could not save confusion/ROC plots:", e)
-
-    print("=== Backtesting Results ===")
-    print(f"Total Return: {metrics['total_return_pct']:.2f}%")
-    print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
-    print(f"Max Drawdown: {metrics['max_drawdown_pct']:.2f}%")
-    print(f"Win Rate: {metrics['win_rate_pct']:.2f}%")
-    print(f"Total Trades: {metrics['total_trades']}")
-    print(f"\nPlots saved to {figures_dir}")
-    print(f"Metrics saved to {metrics_dir / 'backtest_results.json'}")
+    return (np.mean(excess) / downside_std) * np.sqrt(annualization_factor)
 
 
-if __name__ == "__main__":
-    main()
+def compute_calmar_ratio(
+    returns: np.ndarray,
+    annualization_factor: int = 252,
+) -> float:
+    """
+    Calmar Ratio: annualized return / max drawdown.
+
+    Measures how well the strategy compensates for its worst
+    peak-to-trough decline. Values > 1.0 are generally considered good.
+
+    Args:
+        returns: Array of periodic returns.
+        annualization_factor: Trading days per year.
+
+    Returns:
+        Calmar Ratio (positive value; 0 if max drawdown is ~0).
+    """
+    if len(returns) < 2:
+        return 0.0
+
+    cumulative = np.cumprod(1.0 + returns)
+    running_max = np.maximum.accumulate(cumulative)
+    drawdowns = (cumulative - running_max) / running_max
+    max_dd = np.abs(np.min(drawdowns))
+
+    if max_dd < 1e-10:
+        return 0.0
+
+    annualized_return = np.mean(returns) * annualization_factor
+    return annualized_return / max_dd
+
+
+def compute_omega_ratio(
+    returns: np.ndarray,
+    threshold: float = 0.0,
+) -> float:
+    """
+    Omega Ratio: probability-weighted gains / probability-weighted losses.
+
+    A more complete measure than Sharpe as it considers the entire
+    return distribution, not just the first two moments.
+
+    Args:
+        returns: Array of periodic returns.
+        threshold: Minimum acceptable return (default 0).
+
+    Returns:
+        Omega Ratio (values > 1 indicate net positive performance).
+    """
+    if len(returns) < 2:
+        return 0.0
+
+    excess = returns - threshold
+    gains = np.sum(excess[excess > 0])
+    losses = np.abs(np.sum(excess[excess <= 0]))
+
+    if losses < 1e-10:
+        return float("inf") if gains > 0 else 0.0
+
+    return gains / losses
+
+
+def compute_tail_risk(
+    returns: np.ndarray,
+    confidence_levels: tuple = (0.95, 0.99),
+) -> Dict[str, float]:
+    """
+    Value-at-Risk (VaR) and Conditional VaR (Expected Shortfall).
+
+    VaR: maximum expected loss at a given confidence level.
+    CVaR: expected loss given that loss exceeds VaR (tail average).
+
+    Args:
+        returns: Array of periodic returns.
+        confidence_levels: Tuple of confidence levels.
+
+    Returns:
+        Dictionary with VaR and CVaR at each confidence level.
+    """
+    results = {}
+    for cl in confidence_levels:
+        alpha = 1 - cl
+        var = np.percentile(returns, alpha * 100)
+        cvar = np.mean(returns[returns <= var]) if np.any(returns <= var) else var
+        pct = int(cl * 100)
+        results[f"VaR_{pct}"] = float(var)
+        results[f"CVaR_{pct}"] = float(cvar)
+    return results
+
+
+def compute_gain_to_pain_ratio(returns: np.ndarray) -> float:
+    """
+    Gain-to-Pain Ratio: sum of all returns / sum of absolute negative returns.
+
+    A simple but effective measure of whether cumulative profits
+    justify the pain of drawdowns experienced along the way.
+
+    Args:
+        returns: Array of periodic returns.
+
+    Returns:
+        Gain-to-Pain ratio.
+    """
+    if len(returns) < 2:
+        return 0.0
+
+    total_return = np.sum(returns)
+    total_pain = np.sum(np.abs(returns[returns < 0]))
+
+    if total_pain < 1e-10:
+        return float("inf") if total_return > 0 else 0.0
+
+    return total_return / total_pain
+
+
+def compute_enhanced_metrics(
+    returns: np.ndarray,
+    risk_free_rate: float = 0.0,
+    annualization_factor: int = 252,
+) -> Dict[str, float]:
+    """
+    Compute all enhanced risk metrics in a single call.
+
+    Designed to be called alongside existing backtest metrics.
+    Returns a flat dictionary that can be merged with existing
+    backtest_results.json output.
+
+    Args:
+        returns: Array of daily strategy returns.
+        risk_free_rate: Daily risk-free rate.
+        annualization_factor: Trading days per year.
+
+    Returns:
+        Dictionary containing all enhanced metrics.
+
+    Example:
+        >>> returns = np.array([0.01, -0.005, 0.008, -0.002, 0.003])
+        >>> metrics = compute_enhanced_metrics(returns)
+        >>> print(f"Sortino: {metrics['sortino_ratio']:.2f}")
+    """
+    metrics = {
+        "sortino_ratio": compute_sortino_ratio(
+            returns, risk_free_rate, annualization_factor
+        ),
+        "calmar_ratio": compute_calmar_ratio(returns, annualization_factor),
+        "omega_ratio": compute_omega_ratio(returns),
+        "gain_to_pain_ratio": compute_gain_to_pain_ratio(returns),
+    }
+
+    tail = compute_tail_risk(returns)
+    metrics.update({k.lower(): v for k, v in tail.items()})
+
+    return metrics
