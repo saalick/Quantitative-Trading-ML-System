@@ -15,7 +15,7 @@ This repository implements a **fully functional** ML trading pipeline: load OHLC
 
 | Metric | Value |
 |--------|--------|
-| Directional Accuracy | ~73% |
+| Directional Accuracy | ~70% |
 | Sharpe Ratio | 1.5–2.0 |
 | Max Drawdown | &lt; 15% |
 | Total Trades | 800+ |
